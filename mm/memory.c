@@ -70,7 +70,6 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/dax.h>
 #include <linux/oom.h>
-#include <linux/mm_inline.h>
 
 #include <asm/io.h>
 #include <asm/mmu_context.h>
@@ -473,7 +472,7 @@ static void free_pte_range(struct mmu_gather *tlb, pmd_t *pmd,
 	pgtable_t token = pmd_pgtable(*pmd);
 	pmd_clear(pmd);
 	pte_free_tlb(tlb, token, addr);
-	atomic_long_dec(&tlb->mm->nr_ptes);
+	mm_dec_nr_ptes(tlb->mm);
 }
 
 static inline void free_pmd_range(struct mmu_gather *tlb, pud_t *pud,
@@ -574,6 +573,7 @@ static inline void free_p4d_range(struct mmu_gather *tlb, pgd_t *pgd,
 	p4d = p4d_offset(pgd, start);
 	pgd_clear(pgd);
 	p4d_free_tlb(tlb, p4d, start);
+	mm_dec_nr_puds(tlb->mm);
 }
 
 /*
@@ -704,7 +704,7 @@ int __pte_alloc(struct mm_struct *mm, pmd_t *pmd, unsigned long address)
 
 	ptl = pmd_lock(mm, pmd);
 	if (likely(pmd_none(*pmd))) {	/* Has another populated it ? */
-		atomic_long_inc(&mm->nr_ptes);
+		mm_inc_nr_ptes(mm);
 		pmd_populate(mm, pmd, new);
 		new = NULL;
 	}
@@ -3029,46 +3029,31 @@ static int do_wp_page(struct vm_fault *vmf)
 	 * Take out anonymous pages first, anonymous shared vmas are
 	 * not dirty accountable.
 	 */
-	if (PageAnon(vmf->page) && !PageKsm(vmf->page)) {
-		int total_map_swapcount;
-		if (!trylock_page(vmf->page)) {
-			get_page(vmf->page);
-			pte_unmap_unlock(vmf->pte, vmf->ptl);
-			lock_page(vmf->page);
-			if (!pte_map_lock(vmf)) {
-				unlock_page(vmf->page);
-				put_page(vmf->page);
-				return VM_FAULT_RETRY;
-			}
-			if (!pte_same(*vmf->pte, vmf->orig_pte)) {
-				unlock_page(vmf->page);
-				pte_unmap_unlock(vmf->pte, vmf->ptl);
-				put_page(vmf->page);
-				return 0;
-			}
-			put_page(vmf->page);
+	if (PageAnon(vmf->page)) {
+		struct page *page = vmf->page;
+
+		/* PageKsm() doesn't necessarily raise the page refcount */
+		if (PageKsm(page) || page_count(page) != 1)
+			goto copy;
+		if (!trylock_page(page))
+			goto copy;
+		if (PageKsm(page) || page_mapcount(page) != 1 || page_count(page) != 1) {
+			unlock_page(page);
+			goto copy;
 		}
-		if (reuse_swap_page(vmf->page, &total_map_swapcount)) {
-			if (total_map_swapcount == 1) {
-				/*
-				 * The page is all ours. Move it to
-				 * our anon_vma so the rmap code will
-				 * not search our parent or siblings.
-				 * Protected against the rmap code by
-				 * the page lock.
-				 */
-				page_move_anon_rmap(vmf->page, vma);
-			}
-			unlock_page(vmf->page);
-			wp_page_reuse(vmf);
-			return VM_FAULT_WRITE;
-		}
-		unlock_page(vmf->page);
-	} else if (unlikely((vmf->vma_flags & (VM_WRITE|VM_SHARED)) ==
+		/*
+		 * Ok, we've got the only map reference, and the only
+		 * page count reference, and the page is locked,
+		 * it's dark out, and we're wearing sunglasses. Hit it.
+		 */
+		unlock_page(page);
+		wp_page_reuse(vmf);
+		return VM_FAULT_WRITE;
+	} else if (unlikely((vma->vm_flags & (VM_WRITE|VM_SHARED)) ==
 					(VM_WRITE|VM_SHARED))) {
 		return wp_page_shared(vmf);
 	}
-
+copy:
 	/*
 	 * Ok, we need to copy. Oh, well..
 	 */
@@ -3155,21 +3140,6 @@ void unmap_mapping_range(struct address_space *mapping,
 }
 EXPORT_SYMBOL(unmap_mapping_range);
 
-static void lru_gen_swap_refault(struct page *page, swp_entry_t entry)
-{
-	if (lru_gen_enabled()) {
-		void *item;
-		struct address_space *mapping = swap_address_space(entry);
-		pgoff_t index = swp_offset(entry);
-
-		rcu_read_lock();
-		item = radix_tree_lookup(&mapping->page_tree, index);
-		rcu_read_unlock();
-		if (radix_tree_exceptional_entry(item))
-			lru_gen_refault(page, item);
-	}
-}
-
 /*
  * We enter with non-exclusive mmap_sem (to exclude vma changes,
  * but allow concurrent faults), and pte mapped but not yet locked.
@@ -3251,7 +3221,6 @@ int do_swap_page(struct vm_fault *vmf)
 				__SetPageLocked(page);
 				__SetPageSwapBacked(page);
 				set_page_private(page, entry.val);
-				lru_gen_swap_refault(page, entry);
 				lru_cache_add_anon(page);
 				swap_readpage(page, true);
 			}
@@ -3599,11 +3568,16 @@ static int __do_fault(struct vm_fault *vmf)
 		return ret;
 
 	if (unlikely(PageHWPoison(vmf->page))) {
-		if (ret & VM_FAULT_LOCKED)
+		int poisonret = VM_FAULT_HWPOISON;
+		if (ret & VM_FAULT_LOCKED) {
+			/* Retry if a clean page was removed from the cache. */
+			if (invalidate_inode_page(vmf->page))
+				poisonret = 0;
 			unlock_page(vmf->page);
+		}
 		put_page(vmf->page);
 		vmf->page = NULL;
-		return VM_FAULT_HWPOISON;
+		return poisonret;
 	}
 
 	if (unlikely(!(ret & VM_FAULT_LOCKED)))
@@ -3638,7 +3612,7 @@ static int pte_alloc_one_map(struct vm_fault *vmf)
 			goto map_pte;
 		}
 
-		atomic_long_inc(&vma->vm_mm->nr_ptes);
+		mm_inc_nr_ptes(vma->vm_mm);
 		pmd_populate(vma->vm_mm, vmf->pmd, vmf->prealloc_pte);
 		spin_unlock(vmf->ptl);
 		vmf->prealloc_pte = NULL;
@@ -3698,7 +3672,7 @@ static void deposit_prealloc_pte(struct vm_fault *vmf)
 	 * We are going to consume the prealloc table,
 	 * count that as nr_ptes.
 	 */
-	atomic_long_inc(&vma->vm_mm->nr_ptes);
+	mm_dec_nr_ptes(vma->vm_mm);
 	vmf->prealloc_pte = NULL;
 }
 
@@ -4714,9 +4688,9 @@ int __handle_speculative_fault(struct mm_struct *mm, unsigned long address,
 		return VM_FAULT_RETRY;
 	}
 
-	task_enter_user_fault();
+	mem_cgroup_enter_user_fault();
 	ret = handle_pte_fault(&vmf);
-	task_exit_user_fault();
+	mem_cgroup_exit_user_fault();
 
 	/*
 	 * If there is no need to retry, don't return the vma to the caller.
@@ -4801,7 +4775,7 @@ int handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 	 * space.  Kernel faults are handled more gracefully.
 	 */
 	if (flags & FAULT_FLAG_USER)
-		task_enter_user_fault();
+		mem_cgroup_enter_user_fault();
 
 	if (unlikely(is_vm_hugetlb_page(vma)))
 		ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
@@ -4809,7 +4783,7 @@ int handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 		ret = __handle_mm_fault(vma, address, flags);
 
 	if (flags & FAULT_FLAG_USER) {
-		task_exit_user_fault();
+		mem_cgroup_exit_user_fault();
 		/*
 		 * The task may have entered a memcg OOM situation but
 		 * if the allocation error was handled gracefully (no
@@ -4862,15 +4836,21 @@ int __pud_alloc(struct mm_struct *mm, p4d_t *p4d, unsigned long address)
 
 	spin_lock(&mm->page_table_lock);
 #ifndef __ARCH_HAS_5LEVEL_HACK
-	if (p4d_present(*p4d))		/* Another has populated it */
+	if (p4d_present(*p4d)) {
+		/* Another has populated it */
 		pud_free(mm, new);
-	else
+	} else {
+		mm_inc_nr_puds(mm);
 		p4d_populate(mm, p4d, new);
+	}
 #else
-	if (pgd_present(*p4d))		/* Another has populated it */
+	if (pgd_present(*p4d)) {
+		/* Another has populated it */
 		pud_free(mm, new);
-	else
+	} else {
+		mm_inc_nr_puds(mm);
 		pgd_populate(mm, p4d, new);
+	}
 #endif /* __ARCH_HAS_5LEVEL_HACK */
 	spin_unlock(&mm->page_table_lock);
 	return 0;

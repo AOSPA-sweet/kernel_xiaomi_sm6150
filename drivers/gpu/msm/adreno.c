@@ -20,6 +20,7 @@
 #include <linux/io.h>
 #include <soc/qcom/scm.h>
 #include <soc/qcom/boot_stats.h>
+#include <linux/nvmem-consumer.h>
 
 #include <linux/msm-bus-board.h>
 #include <linux/msm-bus.h>
@@ -559,8 +560,6 @@ static irqreturn_t adreno_irq_handler(struct kgsl_device *device)
 		tmp &= ~BIT(i);
 	}
 
-	gpudev->irq_trace(adreno_dev, status);
-
 	/*
 	 * Clear ADRENO_INT_RBBM_AHB_ERROR bit after this interrupt has been
 	 * cleared in its respective handler
@@ -912,6 +911,88 @@ static int adreno_of_get_pwrlevels(struct adreno_device *adreno_dev,
 	return -ENODEV;
 }
 
+static int adreno_read_gpu_model_fuse(struct platform_device *pdev)
+{
+	struct nvmem_cell *cell = nvmem_cell_get(&pdev->dev, "gpu_model");
+	int ret = PTR_ERR_OR_ZERO(cell);
+	void *buf;
+	int val = 0;
+	size_t len;
+
+	if (ret)
+		return ret;
+
+	buf = nvmem_cell_read(cell, &len);
+	nvmem_cell_put(cell);
+
+	if (IS_ERR(buf))
+		return PTR_ERR(buf);
+
+	memcpy(&val, buf, min(len, sizeof(val)));
+	kfree(buf);
+
+	return val;
+}
+
+static struct device_node *
+adreno_get_gpu_model_node(struct platform_device *pdev)
+{
+	struct device_node *node, *child;
+	int fuse_model = adreno_read_gpu_model_fuse(pdev);
+
+	if (fuse_model < 0)
+		return NULL;
+
+	node = of_find_node_by_name(pdev->dev.of_node, "qcom,gpu-models");
+	if (node == NULL)
+		return NULL;
+
+	for_each_child_of_node(node, child) {
+		u32 model;
+
+		if (of_property_read_u32(child, "qcom,gpu-model-id", &model))
+			continue;
+
+		if (model == fuse_model) {
+			of_node_put(node);
+			return child;
+		}
+	}
+
+	of_node_put(node);
+
+	return NULL;
+}
+
+static const char *adreno_get_gpu_model(struct kgsl_device *device)
+{
+	struct device_node *node;
+	static char gpu_model[32];
+	const char *model;
+	int ret;
+
+	if (strlen(gpu_model))
+		return gpu_model;
+
+	node = adreno_get_gpu_model_node(device->pdev);
+	if (!node)
+		node = of_node_get(device->pdev->dev.of_node);
+
+	ret = of_property_read_string(node, "qcom,gpu-model", &model);
+	of_node_put(node);
+
+	if (!ret)
+		strlcpy(gpu_model, model, sizeof(gpu_model));
+	else
+		scnprintf(gpu_model, sizeof(gpu_model), "Adreno%d%d%dv%d",
+			ADRENO_CHIPID_CORE(ADRENO_DEVICE(device)->chipid),
+			ADRENO_CHIPID_MAJOR(ADRENO_DEVICE(device)->chipid),
+			ADRENO_CHIPID_MINOR(ADRENO_DEVICE(device)->chipid),
+			ADRENO_CHIPID_PATCH(ADRENO_DEVICE(device)->chipid) + 1);
+
+	return gpu_model;
+}
+
 static void
 l3_pwrlevel_probe(struct kgsl_device *device, struct device_node *node)
 {
@@ -1188,6 +1269,26 @@ static bool adreno_is_gpu_disabled(struct adreno_device *adreno_dev)
 			pte_row0_msb[1] ? true : false;
 }
 
+static u32 adreno_get_vk_device_id(struct kgsl_device *device)
+{
+	struct device_node *node;
+	static u32 device_id;
+
+	if (device_id)
+		return device_id;
+
+	node = adreno_get_gpu_model_node(device->pdev);
+	if (!node)
+		node = of_node_get(device->pdev->dev.of_node);
+
+	if (of_property_read_u32(node, "qcom,vk-device-id", &device_id))
+		device_id = ADRENO_DEVICE(device)->chipid;
+
+	of_node_put(node);
+
+	return device_id;
+}
+
 static int adreno_probe(struct platform_device *pdev)
 {
 	struct kgsl_device *device;
@@ -1309,9 +1410,6 @@ static int adreno_probe(struct platform_device *pdev)
 
 	kgsl_pwrscale_init(&pdev->dev, CONFIG_QCOM_ADRENO_DEFAULT_GOVERNOR);
 
-	/* Initialize coresight for the target */
-	adreno_coresight_init(adreno_dev);
-
 	/* Get the system cache slice descriptor for GPU */
 	adreno_dev->gpu_llc_slice = adreno_llc_getd(&pdev->dev, "gpu");
 	if (IS_ERR(adreno_dev->gpu_llc_slice) &&
@@ -1382,7 +1480,6 @@ static int adreno_remove(struct platform_device *pdev)
 
 	adreno_sysfs_close(adreno_dev);
 
-	adreno_coresight_remove(adreno_dev);
 	adreno_profile_close(adreno_dev);
 
 	/* Release the system cache slice descriptor */
@@ -1694,13 +1791,6 @@ int adreno_set_unsecured_mode(struct adreno_device *adreno_dev,
 	if (!adreno_is_a5xx(adreno_dev) && !adreno_is_a6xx(adreno_dev))
 		return -EINVAL;
 
-	if (ADRENO_QUIRK(adreno_dev, ADRENO_QUIRK_CRITICAL_PACKETS) &&
-			adreno_is_a5xx(adreno_dev)) {
-		ret = a5xx_critical_packet_submit(adreno_dev, rb);
-		if (ret)
-			return ret;
-	}
-
 	/* GPU comes up in secured mode, make it unsecured by default */
 	if (adreno_dev->zap_handle_ptr)
 		ret = adreno_switch_to_unsecure_mode(adreno_dev, rb);
@@ -2008,9 +2098,6 @@ static int _adreno_start(struct adreno_device *adreno_dev)
 	 */
 	adreno_llc_setup(device);
 
-	/* Re-initialize the coresight registers if applicable */
-	adreno_coresight_start(adreno_dev);
-
 	adreno_irqctrl(adreno_dev, 1);
 
 	adreno_perfcounter_start(adreno_dev);
@@ -2150,9 +2237,6 @@ static int adreno_stop(struct kgsl_device *device)
 
 	adreno_llc_deactivate_slice(adreno_dev->gpu_llc_slice);
 	adreno_llc_deactivate_slice(adreno_dev->gpuhtw_llc_slice);
-
-	/* Save active coresight registers if applicable */
-	adreno_coresight_stop(adreno_dev);
 
 	/* Save physical performance counter values before GPU power down*/
 	adreno_perfcounter_save(adreno_dev);
@@ -2694,6 +2778,24 @@ static int adreno_getproperty(struct kgsl_device *device,
 	}
 	break;
 
+	case KGSL_PROP_VK_DEVICE_ID:
+	{
+		unsigned int vk_dev_id;
+		if (sizebytes < sizeof(unsigned int)) {
+			status = -EINVAL;
+			break;
+		}
+
+		vk_dev_id = adreno_get_vk_device_id(device);
+
+		if (copy_to_user(value, &vk_dev_id, sizeof(unsigned int))) {
+			status = -EFAULT;
+			break;
+		}
+		status = 0;
+	}
+	break;
+
 	default:
 		status = -EINVAL;
 	}
@@ -3002,9 +3104,6 @@ int adreno_soft_reset(struct kgsl_device *device)
 
 	/* Reinitialize the GPU */
 	gpudev->start(adreno_dev);
-
-	/* Re-initialize the coresight registers if applicable */
-	adreno_coresight_start(adreno_dev);
 
 	/* Enable IRQ */
 	adreno_irqctrl(adreno_dev, 1);
@@ -3958,13 +4057,7 @@ static void adreno_regulator_disable_poll(struct kgsl_device *device)
 static void adreno_gpu_model(struct kgsl_device *device, char *str,
 				size_t bufsz)
 {
-	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
-
-	snprintf(str, bufsz, "Adreno%d%d%dv%d",
-			ADRENO_CHIPID_CORE(adreno_dev->chipid),
-			 ADRENO_CHIPID_MAJOR(adreno_dev->chipid),
-			 ADRENO_CHIPID_MINOR(adreno_dev->chipid),
-			 ADRENO_CHIPID_PATCH(adreno_dev->chipid) + 1);
+	scnprintf(str, bufsz, adreno_get_gpu_model(device));
 }
 
 static int adreno_suspend_device(struct kgsl_device *device,
@@ -4090,6 +4183,7 @@ static const struct kgsl_functable adreno_functable = {
 	.stop_fault_timer = adreno_dispatcher_stop_fault_timer,
 	.suspend_device = adreno_suspend_device,
 	.resume_device = adreno_resume_device,
+	.get_vk_device_id = adreno_get_vk_device_id
 };
 
 static struct platform_driver adreno_platform_driver = {

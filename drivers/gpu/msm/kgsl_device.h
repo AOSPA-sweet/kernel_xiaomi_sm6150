@@ -156,6 +156,7 @@ struct kgsl_functable {
 	int (*drain)(struct kgsl_device *device);
 	struct kgsl_device_private * (*device_private_create)(void);
 	void (*device_private_destroy)(struct kgsl_device_private *dev_priv);
+	uint32_t (*get_vk_device_id)(struct kgsl_device *device);
 	/*
 	 * Optional functions - these functions are not mandatory.  The
 	 * driver will check that the function pointer is not NULL before
@@ -730,10 +731,13 @@ void kgsl_device_platform_remove(struct kgsl_device *device);
 
 const char *kgsl_pwrstate_to_str(unsigned int state);
 
-int kgsl_device_snapshot_init(struct kgsl_device *device);
-void kgsl_device_snapshot(struct kgsl_device *device,
-			struct kgsl_context *context, bool gmu_fault);
-void kgsl_device_snapshot_close(struct kgsl_device *device);
+static inline int kgsl_device_snapshot_init(struct kgsl_device *device)
+{
+	return 0;
+}
+static inline void kgsl_device_snapshot(struct kgsl_device *device,
+			struct kgsl_context *context, bool gmu_fault) {}
+static inline void kgsl_device_snapshot_close(struct kgsl_device *device) {}
 
 void kgsl_events_init(void);
 void kgsl_events_exit(void);

@@ -517,7 +517,7 @@ struct cfs_bandwidth { };
 /* CFS-related fields in a runqueue */
 struct cfs_rq {
 	struct load_weight load;
-	unsigned int nr_running, h_nr_running;
+	unsigned int nr_running, h_nr_running, idle_h_nr_running;
 
 	u64 exec_clock;
 	u64 min_vruntime;
@@ -1394,9 +1394,10 @@ DECLARE_PER_CPU(int, sd_llc_size);
 DECLARE_PER_CPU(int, sd_llc_id);
 DECLARE_PER_CPU(struct sched_domain_shared *, sd_llc_shared);
 DECLARE_PER_CPU(struct sched_domain *, sd_numa);
-DECLARE_PER_CPU(struct sched_domain *, sd_asym);
 DECLARE_PER_CPU(struct sched_domain *, sd_ea);
 DECLARE_PER_CPU(struct sched_domain *, sd_scs);
+DECLARE_PER_CPU(struct sched_domain *, sd_asym_packing);
+DECLARE_PER_CPU(struct sched_domain *, sd_asym_cpucapacity);
 extern struct static_key_false sched_asym_cpucapacity;
 
 struct sched_group_capacity {
@@ -2874,6 +2875,35 @@ static inline int cpu_capacity(int cpu)
 	return cpu_rq(cpu)->cluster->capacity;
 }
 
+static inline bool asym_cap_sibling_group_has_capacity(int dst_cpu, int margin)
+{
+	int sib1, sib2;
+	int nr_running;
+	unsigned long total_util, total_capacity;
+
+	if (cpumask_empty(&asym_cap_sibling_cpus) ||
+			cpumask_test_cpu(dst_cpu, &asym_cap_sibling_cpus))
+		return false;
+
+	sib1 = cpumask_first(&asym_cap_sibling_cpus);
+	sib2 = cpumask_last(&asym_cap_sibling_cpus);
+
+	if (!cpu_active(sib1) || cpu_isolated(sib1) ||
+		!cpu_active(sib2) || cpu_isolated(sib2))
+		return false;
+
+	nr_running = cpu_rq(sib1)->cfs.h_nr_running +
+			cpu_rq(sib2)->cfs.h_nr_running;
+
+	if (nr_running <= 2)
+		return true;
+
+	total_capacity = capacity_of(sib1) + capacity_of(sib2);
+	total_util = cpu_util(sib1) + cpu_util(sib2);
+
+	return ((total_capacity * 100) > (total_util * margin));
+}
+
 static inline int cpu_max_possible_capacity(int cpu)
 {
 	return cpu_rq(cpu)->cluster->max_possible_capacity;
@@ -3165,22 +3195,18 @@ void note_task_waking(struct task_struct *p, u64 wallclock);
 
 static inline bool task_placement_boost_enabled(struct task_struct *p)
 {
-	if (likely(sched_boost_policy() == SCHED_BOOST_NONE))
-		return false;
+	if (task_sched_boost(p))
+		return sched_boost_policy() != SCHED_BOOST_NONE;
 
-	return task_sched_boost(p);
+	return false;
 }
+
 
 static inline enum sched_boost_policy task_boost_policy(struct task_struct *p)
 {
-	enum sched_boost_policy policy = sched_boost_policy();
-
-	if (likely(policy == SCHED_BOOST_NONE))
-		return SCHED_BOOST_NONE;
-
-	if (!task_sched_boost(p))
-		return SCHED_BOOST_NONE;
-
+	enum sched_boost_policy policy = task_sched_boost(p) ?
+							sched_boost_policy() :
+							SCHED_BOOST_NONE;
 	if (policy == SCHED_BOOST_ON_BIG) {
 		/*
 		 * Filter out tasks less than min task util threshold
@@ -3256,6 +3282,11 @@ static inline int cpu_capacity(int cpu)
 	return capacity_orig_of(cpu);
 }
 #endif
+
+static inline bool asym_cap_sibling_group_has_capacity(int dst_cpu, int margin)
+{
+	return false;
+}
 
 static inline void set_preferred_cluster(struct related_thread_group *grp) { }
 

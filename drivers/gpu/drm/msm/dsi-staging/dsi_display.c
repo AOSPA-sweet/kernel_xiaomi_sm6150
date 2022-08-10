@@ -63,8 +63,6 @@ static const struct of_device_id dsi_display_dt_match[] = {
 	{}
 };
 
-static unsigned int cur_refresh_rate = 60;
-
 struct dsi_display *primary_display;
 struct dsi_display *get_primary_display(void)
 {
@@ -5301,6 +5299,7 @@ static ssize_t sysfs_hbm_write(struct device *dev,
 {
 	struct dsi_display *display = dev_get_drvdata(dev);
 	int ret, hbm_mode;
+	int bl_lvl_before_hbm = display->panel->bl_config.bl_level;
 
 	if (!display->panel)
 		return -EINVAL;
@@ -5325,7 +5324,6 @@ static ssize_t sysfs_hbm_write(struct device *dev,
 		goto error;
 	}
 
-	int bl_lvl_before_hbm = display->panel->bl_config.bl_level;
 	ret = dsi_panel_apply_hbm_mode(display->panel);
 	if (ret)
 		pr_err("unable to set hbm mode\n");
@@ -5505,11 +5503,7 @@ static int dsi_display_bind(struct device *dev,
 		goto error;
 	}
 
-	rc = dsi_display_debugfs_init(display);
-	if (rc) {
-		pr_err("[%s] debugfs init failed, rc=%d\n", display->name, rc);
-		goto error;
-	}
+	dsi_display_debugfs_init(display);
 
 	atomic_set(&display->clkrate_change_pending, 0);
 	display->cached_clk_rate = 0;
@@ -7893,11 +7887,6 @@ int dsi_display_pre_commit(void *display,
 	return rc;
 }
 
-unsigned int dsi_panel_get_refresh_rate(void)
-{
-	return READ_ONCE(cur_refresh_rate);
-}
-
 int dsi_display_enable(struct dsi_display *display)
 {
 	int rc = 0;
@@ -7951,7 +7940,6 @@ int dsi_display_enable(struct dsi_display *display)
 	mutex_lock(&display->display_lock);
 
 	mode = display->panel->cur_mode;
-	WRITE_ONCE(cur_refresh_rate, mode->timing.refresh_rate);
 
 	if (mode->dsi_mode_flags & DSI_MODE_FLAG_DMS) {
 		rc = dsi_panel_post_switch(display->panel);
